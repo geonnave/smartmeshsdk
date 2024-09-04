@@ -510,6 +510,7 @@ class JsonManager(object):
     #=== status
     
     def status_GET(self):
+        time_manager = list(self.managerHandlers.values())[0].connector.dn_getTime()
         return {
             'SmartMesh SDK version': '.'.join([str(b) for b in sdk_version.VERSION]),
             'current time':          self._formatTime(),
@@ -519,6 +520,17 @@ class JsonManager(object):
             ),
             'threads running':       [t.getName() for t in threading.enumerate()],
             'managers':              self._formatManagersStatus(),
+            'utcSecsManager': time_manager.utcSecs,
+            'utcUsecsManager': time_manager.utcUsecs,
+        }
+    
+    #=== reset
+    
+    def reset_GET(self):
+        res = list(self.managerHandlers.values())[0].connector.dn_reset(0, [0,1,2,3,4,5,6,7])
+        # print(f"reset res: {res}")
+        return {
+            'status': 'asked for reset',
         }
     
     #=== raw

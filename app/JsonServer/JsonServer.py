@@ -124,6 +124,8 @@ class JsonServer(object):
         self.websrv.route('/static/<filename>',                           'GET',    self._webhandle_static)
         #=== status
         self.websrv.route('/api/v1/status',                               'GET',    self._webhandle_status_GET)
+        #=== reset
+        self.websrv.route('/api/v1/reset',                                'GET',    self._webhandle_reset_GET)
         #=== raw
         self.websrv.route('/api/v1/raw',                                  'POST',   self._webhandle_raw_POST)
         #=== raw data to the mote
@@ -281,6 +283,11 @@ class JsonServer(object):
     
     def _webhandle_status_GET(self):
         return self.jsonManager.status_GET()
+    
+    #=== reset
+    
+    def _webhandle_reset_GET(self):
+        return self.jsonManager.reset_GET()
     
     #=== raw
     

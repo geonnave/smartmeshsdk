@@ -3,19 +3,22 @@ from dataclasses import dataclass
 from lakers import EdhocResponder, AuthzAutenticator
 from random import randint
 from typing import Optional
+from datetime import datetime
 import paho.mqtt.client as mqtt
 import json
 import lakers
 import requests
 import sys
-import logging
+# import logging
+import rich
+import threading
 
 if len(sys.argv) == 2:
     MANAGER_SERIAL = sys.argv[1]
 else:
     MANAGER_SERIAL = '/dev/tty.usbserial-144303'
 
-logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
 
 TOPIC = "aiotacademy"
 
@@ -35,6 +38,88 @@ class OngoingEdhocSession:
 ongoing_sessions = {}
 authorized_motes = {}
 
+#============================ sync time =======================================
+
+class ManagerTime(threading.Thread):
+    '''
+    This class periodically sends a getTime() API command to the manager to map
+    network time to UTC time. The offset is used to calculate the pkt arrival
+    time for the same time base as the mote.
+    '''
+
+    def __init__(self, initial_offset=0, sleepperiod=10):
+        self.offset    = initial_offset
+        # init the parent
+        threading.Thread.__init__(self)
+        self.event                  = threading.Event()
+        self.sleepperiod            = sleepperiod
+        self.daemon                 = True
+        # give this thread a name
+        self.name                   = 'ManagerTime'
+
+    def run(self):
+        while True:
+            try:
+                # Get PC time and send the getTime command to the Manager
+                pc_time = datetime.now().timestamp()
+                # mgr_timepinres = AppData().get('connector').dn_getTime()
+                mgr_timepinres = requests.get('http://127.0.0.1:8080/api/v1/status').json()
+                mgr_time = self.secs_usecs_to_timestamp(mgr_timepinres['utcSecsManager'], mgr_timepinres['utcUsecsManager'])
+                self.offset = pc_time - mgr_time
+                # print(f"PC time: {pc_time}, Manager time: {mgr_time}, Offset: {self.offset}")
+            except Exception as e:
+                print(f"Exception in ManagerTime (manager not available?): {e}")
+
+            self.event.wait(self.sleepperiod)
+
+    def secs_usecs_to_timestamp(self, secs, usecs):
+        return secs + usecs / 1e6
+
+    def network_time_to_pc_time(self, secs, usecs):
+        return self.secs_usecs_to_timestamp(secs, usecs) + self.offset
+
+manager_time = ManagerTime()
+
+session_times = {"start": 0, "end": 0, "delta": 0}
+
+results_dir = "/home/gfedrech/Developer/inria/paper-authz/data/scenario2_network_time-10sep2024"
+log_file_suffix = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+# log_file_suffix = "DBG"
+# log_file_suffix = "2024-09-11_17-47-52"; input("ATTENTION: using hardcoded log file suffix. Press enter to continue...")
+
+#============================ input handler ===================================
+def post_data_to_mote(mac, data):
+    print(f"Sending EAP-EDHOC message to {mac} ({len(data)} bytes): {data.hex().upper()}")
+    payload = {
+        'payload': list(data),
+        'manager': MANAGER_SERIAL,
+        'mac': mac,
+    }
+    requests.post('http://127.0.0.1:8080/api/v2/raw/sendData', json=payload)
+
+class InputHandler(threading.Thread):
+    def __init__(self, sleepperiod=1):
+        threading.Thread.__init__(self)
+        self.event                  = threading.Event()
+        self.sleepperiod            = sleepperiod
+        self.daemon                 = True
+        self.name                   = 'InputHandler'
+
+    def run(self):
+        while True:
+            cmd = input("Trigger the EAP-EDHOC handshake: ").strip()
+            if cmd == 's':
+                # EAP-Request/Identity: 5 bytes
+                eap_packet_1 = bytes.fromhex('0101000501')
+                session_times["start"] = datetime.now().timestamp()
+                post_data_to_mote("00-17-0d-00-00-59-4d-36", b'\x00' + eap_packet_1)
+            elif cmd == 'r':
+                print(f"reset result: {requests.get('http://127.0.0.1:8080/api/v1/reset').json()}")
+
+            self.event.wait(self.sleepperiod)
+
+input_handler = InputHandler()
+
 #============================ receive from manager ============================
 
 @route('<path:path>', method='ANY')
@@ -43,14 +128,22 @@ def all(path):
     message = json.loads(request.body.getvalue())
 
     if message['name']=='notifData':
+        rich.print(f">>>>>>>>>>>>>>>>>>>> {message}")
         mac = message['fields']['macAddress']
         data = message['fields']['data']
+        timestamps = {
+            'tx': manager_time.network_time_to_pc_time(message['fields']['utcSecs'], message['fields']['utcUsecs']),
+            'rx': datetime.now().timestamp(),
+        }
+        timestamps['delta'] = timestamps['rx'] - timestamps['tx']
+        rich.print(f">>>> message timings: ")
+        rich.print(timestamps)
         if is_edhoc_message_1(data):
             handle_edhoc_message_1(mac, data)
         elif is_edhoc_message_3(data):
             handle_edhoc_message_3(mac, data)
-        elif is_eap_edhoc_message(data):
-            handle_eap_edhoc(mac, data)
+        elif is_signal_alive_message(data) or is_sync_time_message(data) or is_eap_edhoc_message(data):
+            handle_eap_edhoc(mac, data, timestamps)
         else: # check if mote is authorized, if so publish on MQTT
             if mac in authorized_motes.keys():
                 try:
@@ -73,10 +166,10 @@ def request_voucher(
     authz_authenticator = lakers.AuthzAutenticator()
     loc_w, voucher_request = authz_authenticator.process_ead_1(ead_1, message_1)
     voucher_request_url = f"{loc_w}/.well-known/lake-authz/voucher-request"
-    logging.info(f"Requesting voucher at {voucher_request_url} with voucher request {voucher_request.hex(' ').upper()}")
+    print(f"Requesting voucher at {voucher_request_url} with voucher request {voucher_request.hex(' ').upper()}")
     response = requests.post(voucher_request_url, data=voucher_request)
     if response.status_code == 200:
-        logging.info(f"Got an ok voucher response: {response.content.hex(' ').upper()}")
+        print(f"Got an ok voucher response: {response.content.hex(' ').upper()}")
         ead_2 = authz_authenticator.prepare_ead_2(response.content)
         print(f">> ead_2: {ead_2.value().hex(' ').upper()}")
         message_2 = responder.prepare_message_2(
@@ -127,14 +220,15 @@ def handle_edhoc_message_1(mac, message_1):
         print(f"Message 1 ({len(message_1)} bytes) from {mac} received")
         # create new responder
         responder = lakers.EdhocResponder(R, CRED_R)
-        c_r = bytes([randint(0, 24)])
+        c_r = bytes([randint(0, 23)])
+        # c_r = bytes([0])
         _c_i, ead_1 = responder.process_message_1(message_1)
 
         if ead_1 and ead_1.label() == lakers.consts.EAD_AUTHZ_LABEL:
             message_2 = request_voucher(responder, ead_1, message_1, c_r)
         else:
-            # message_2 = responder.prepare_message_2(lakers.CredentialTransfer.ByValue, c_r, None)
-            message_2 = responder.prepare_message_2(lakers.CredentialTransfer.ByReference, c_r, None)
+            message_2 = responder.prepare_message_2(lakers.CredentialTransfer.ByValue, c_r, None)
+            # message_2 = responder.prepare_message_2(lakers.CredentialTransfer.ByReference, c_r, None)
             # save the responder into existing sessions
             ongoing_sessions[c_r] = OngoingEdhocSession(responder)
 
@@ -181,14 +275,20 @@ def is_edhoc_message_3(data):
     if bytes([data[0]]) in ongoing_sessions.keys():
         return True
 
+def is_signal_alive_message(data):
+    return data == [0xaa, 0xaa, 0xaa, 0xaa]
+
+def is_sync_time_message(data):
+    return data[:4] == [0xbb, 0xbb, 0xbb, 0xbb]
+
 def post_data_to_mote(mac, data):
     print(f"Sending EAP-EDHOC message to {mac} ({len(data)} bytes): {data.hex().upper()}")
-    requests.post(
-        'http://127.0.0.1:8080/api/v2/raw/sendData',
-        json={'payload': list(data),
+    payload = {
+        'payload': list(data),
         'manager': MANAGER_SERIAL,
-        'mac': mac },
-    )
+        'mac': mac,
+    }
+    requests.post('http://127.0.0.1:8080/api/v2/raw/sendData', json=payload)
 
 from eap_edhoc import EAPBuilder, EAP, EAP_EDHOC
 import eap_edhoc
@@ -219,7 +319,7 @@ def handle_eap_edhoc_message_1(mac, message_1):
         print(f"EAP Message 1 ({len(message_1)} bytes) from {mac} received: {message_1.hex().upper()}")
         # create new responder
         responder = lakers.EdhocResponder(R, CRED_R)
-        c_r = bytes([randint(0, 24)])
+        c_r = bytes([randint(0, 23)])
         _c_i, ead_1 = responder.process_message_1(message_1)
 
         # message_2 = responder.prepare_message_2(lakers.CredentialTransfer.ByValue, c_r, None)
@@ -252,7 +352,31 @@ def handle_eap_edhoc_message_3(mac, message_3):
     except Exception as e:
         print("Exception in message_3 handling from {}. Exception {}".format(mac, e))
 
-def handle_eap_edhoc(mac, data):
+def save_session_time_and_reset_manager(end_time):
+    delta_time = end_time - session_times["start"]
+    print(f"Session duration: {delta_time}")
+    # append delta of this session to the log file
+    filename = f"{results_dir}/session_times_{log_file_suffix}.txt"
+    with open(filename, "a") as f:
+        f.write(f"{delta_time}\n")
+    print("Resetting the manager!!!!")
+    print(f"reset result: {requests.get('http://127.0.0.1:8080/api/v1/reset').json()}")
+    with open(filename, "r") as f:
+        print(f"This was iteration {len(f.readlines())}\n\n\n")
+
+def handle_eap_edhoc(mac, data, timestamps):
+    if is_sync_time_message(data): # last message to signal edhoc-eap end
+        secs, usecs = data[4:8], data[8:12]
+        print(f"secs: {secs}, usecs: {usecs}")
+        end_time = manager_time.network_time_to_pc_time(int.from_bytes(secs, 'big'), int.from_bytes(usecs, 'big'))
+        print(f"t1 time received: {end_time}")
+        save_session_time_and_reset_manager(end_time)
+        return
+    elif is_signal_alive_message(data):
+        session_times["start"] = datetime.now().timestamp()
+        post_data_to_mote("00-17-0d-00-00-59-4d-36", b'\x00' + eap_packet_1.encode())
+        return
+
     data = bytes(data)
     print(f"EAP-EDHOC message ({len(data)} bytes) from {mac} received: {data.hex().upper()}")
     pac = EAPBuilder.decode(data)
@@ -297,6 +421,10 @@ mqtt_client.on_connect = mqtt_on_connect
 mqtt_client.on_message = mqtt_on_message
 mqtt_client.connect("broker.mqttdashboard.com", 1883, 60)
 mqtt_client.loop_start()
+
+#============================ start threads ===================================
+manager_time.start()
+input_handler.start()
 
 #============================ start web server =================================
 
