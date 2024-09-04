@@ -3,12 +3,14 @@ from dataclasses import dataclass
 from lakers import EdhocResponder, AuthzAutenticator
 from random import randint
 from typing import Optional
+from datetime import datetime
 import paho.mqtt.client as mqtt
 import json
 import lakers
 import requests
 import sys
 import logging
+import rich
 
 if len(sys.argv) == 2:
     MANAGER_SERIAL = sys.argv[1]
@@ -50,7 +52,7 @@ def all(path):
         elif is_edhoc_message_3(data):
             handle_edhoc_message_3(mac, data)
         elif is_eap_edhoc_message(data):
-            handle_eap_edhoc(mac, data)
+            handle_eap_edhoc(mac, data, message['fields']['utcSecs'], message['fields']['utcUsecs'])
         else: # check if mote is authorized, if so publish on MQTT
             if mac in authorized_motes.keys():
                 try:
@@ -127,7 +129,8 @@ def handle_edhoc_message_1(mac, message_1):
         print(f"Message 1 ({len(message_1)} bytes) from {mac} received")
         # create new responder
         responder = lakers.EdhocResponder(R, CRED_R)
-        c_r = bytes([randint(0, 24)])
+        # c_r = bytes([randint(0, 24)])
+        c_r = bytes([0])
         _c_i, ead_1 = responder.process_message_1(message_1)
 
         if ead_1 and ead_1.label() == lakers.consts.EAD_AUTHZ_LABEL:
@@ -183,12 +186,12 @@ def is_edhoc_message_3(data):
 
 def post_data_to_mote(mac, data):
     print(f"Sending EAP-EDHOC message to {mac} ({len(data)} bytes): {data.hex().upper()}")
-    requests.post(
-        'http://127.0.0.1:8080/api/v2/raw/sendData',
-        json={'payload': list(data),
+    payload = {
+        'payload': list(data),
         'manager': MANAGER_SERIAL,
-        'mac': mac },
-    )
+        'mac': mac,
+    }
+    requests.post('http://127.0.0.1:8080/api/v2/raw/sendData', json=payload)
 
 from eap_edhoc import EAPBuilder, EAP, EAP_EDHOC
 import eap_edhoc
@@ -252,8 +255,11 @@ def handle_eap_edhoc_message_3(mac, message_3):
     except Exception as e:
         print("Exception in message_3 handling from {}. Exception {}".format(mac, e))
 
-def handle_eap_edhoc(mac, data):
+def handle_eap_edhoc(mac, data, ts_secs, ts_usecs):
     data = bytes(data)
+    # convert to datetime with microseconds
+    dt = datetime.fromtimestamp(ts_secs + ts_usecs / 1e6)
+    print(f">>>>>>>>>>>>>>>> {dt} ({ts_secs}, {ts_usecs})")
     print(f"EAP-EDHOC message ({len(data)} bytes) from {mac} received: {data.hex().upper()}")
     pac = EAPBuilder.decode(data)
 
